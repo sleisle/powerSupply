@@ -48,6 +48,18 @@ static const uint8_t SEVEN_SEG_LOOKUP[] = {
 	0b1111011
 };
 
+static const i2c_address_t I2C_ADDR_1 = 0x24;
+static const i2c_address_t I2C_ADDR_2 = 0x23;
+
+static const uint8_t I2C_CONFIG_1 = 0x06;
+static const uint8_t I2C_CONFIG_2 = 0x07;
+static const uint8_t I2C_OUTPUT_PORT_1 = 0x02;
+static const uint8_t I2C_OUTPUT_PORT_2 = 0x03;
+
+static const uint16_t I2C_TIMEOUT = 10000;
+
+static i2c_error_t lastError;
+
 uint8_t scale_adc(uint16_t adc_val) {
 	return ADC_LOOKUP[adc_val & 0xff];
 }
@@ -80,53 +92,36 @@ typedef struct {
 	uint8_t decimal;
 } seven_seg_t;
 
-static const uint8_t I2C_ADDR_1 = 0x01;
-static const uint8_t I2C_ADDR_2 = 0x02;
-
 typedef struct {
 	uint8_t *data;
 	uint8_t  size;
 } transfer_descriptor_t;
 
-/** This callback is called when the initial write of the pointer register has finished.
-    This callback controls the second phase of the I2C transaction, the read of the
-    targeted register after a REPEATED START.
-*/
-i2c_operations_t i2c_write_callback(void *d)
+i2c_error_t i2c_send(i2c_address_t address, void *data, size_t len)
 {
-	transfer_descriptor_t *desc = (transfer_descriptor_t *)d;
-	I2C_0_set_buffer((void *)desc->data, desc->size);
-	// Set callback to terminate transfer and send STOP after read is complete
-	I2C_0_set_data_complete_callback(i2c_cb_return_stop, NULL);
-	return i2c_restart_read; // Send REPEATED START before read
-}
-
-i2c_error_t i2c_send(
-	uint8_t i2c_addr,
-	uint8_t *data,
-	uint8_t size
-) {
 	/* timeout is used to get out of twim_release, when there is no device connected to the bus*/
-	uint16_t              timeout = 1000;
-	transfer_descriptor_t d       = {data, size};
+	uint16_t timeout = I2C_TIMEOUT;
 
-	while (I2C_BUSY == I2C_0_open(i2c_addr) && --timeout); // sit here until we get the bus..
+	while (I2C_BUSY == I2C_0_open(address) && --timeout); // sit here until we get the bus..
 	if (!timeout)
 	return I2C_BUSY;
-
-	// This callback specifies what to do after the first write operation has completed
-	// The parameters to the callback are bundled together in the aggregate data type d.
-	I2C_0_set_data_complete_callback(i2c_write_callback, &d);
-	// Transmit specified number of bytes
-	I2C_0_set_buffer(d.data, d.size);
-	// Start a Write operation
-	I2C_0_master_operation(false);
-	timeout = 1000;
+	I2C_0_set_buffer(data, len);
+	I2C_0_set_address_nack_callback(i2c_cb_restart_write, NULL); // NACK polling?
+	I2C_0_master_write();
+	timeout = I2C_TIMEOUT;
 	while (I2C_BUSY == I2C_0_close() && --timeout); // sit here until finished.
 	if (!timeout)
 	return I2C_FAIL;
 
 	return I2C_NOERR;
+}
+
+void i2c_send_data(uint8_t addr, uint8_t reg, uint8_t data) {
+	uint8_t i2c_buf[2] = {reg, data};
+	i2c_error_t i2cRet = i2c_send(addr, i2c_buf, 2);
+	if (i2cRet != I2C_NOERR) {
+		lastError = i2cRet;
+	}
 }
 
 int main(void)
@@ -136,47 +131,32 @@ int main(void)
 
 	ADC_0_register_callback(adc_callback);
 
-	uint8_t i2c_buf[2];
-	
-	i2c_buf[0] = 0x06;
-	i2c_buf[1] = 0x00;
-	i2c_send(I2C_ADDR_1, i2c_buf, 2);
-	i2c_buf[0] = 0x07;
-	i2c_buf[1] = 0x00;
-	i2c_send(I2C_ADDR_1, i2c_buf, 2);
-	
-	i2c_buf[0] = 0x06;
-	i2c_buf[1] = 0x00;
-	i2c_send(I2C_ADDR_2, i2c_buf, 2);
-	i2c_buf[0] = 0x07;
-	i2c_buf[1] = 0x00;
-	i2c_send(I2C_ADDR_2, i2c_buf, 2);
+	i2c_send_data(I2C_ADDR_1, I2C_CONFIG_1, 0x0);
+	i2c_send_data(I2C_ADDR_1, I2C_CONFIG_2, 0x0);
+	i2c_send_data(I2C_ADDR_2, I2C_CONFIG_1, 0x0);
+	i2c_send_data(I2C_ADDR_2, I2C_CONFIG_2, 0x0);
+
+	i2c_send_data(I2C_ADDR_1, I2C_OUTPUT_PORT_1, 0x55);
+	i2c_send_data(I2C_ADDR_1, I2C_OUTPUT_PORT_2, 0xAA);
+	i2c_send_data(I2C_ADDR_2, I2C_OUTPUT_PORT_1, 0x55);
 	
 	/* Replace with your application code */
-	while (1) {
-		
-		ENABLE_INTERRUPTS();
-		adc_done = false;
-		ADC_0_start_conversion(0);
-		while (!adc_done);
-		DISABLE_INTERRUPTS();
-		
-		// do something with adc_measurement
-		seven_seg_t display_data;
-		display_data.tens = SEVEN_SEG_LOOKUP[divide(adc_measurement, 100)];
-		display_data.ones = SEVEN_SEG_LOOKUP[divide(modulo(adc_measurement, 100), 10)];
-		display_data.decimal = SEVEN_SEG_LOOKUP[modulo(adc_measurement, 10)];
-		
-		i2c_buf[0] = 0x02;
-		i2c_buf[1] = display_data.tens;
-		i2c_send(I2C_ADDR_1, i2c_buf, 2);
-	
-		i2c_buf[0] = 0x03;
-		i2c_buf[1] = display_data.ones;
-		i2c_send(I2C_ADDR_1, i2c_buf, 2);
-		
-		i2c_buf[0] = 0x02;
-		i2c_buf[1] = display_data.decimal;
-		i2c_send(I2C_ADDR_2, i2c_buf, 2);
-	}
+	//while (1) {
+	//
+	//ENABLE_INTERRUPTS();
+	//adc_done = false;
+	//ADC_0_start_conversion(0);
+	//while (!adc_done);
+	//DISABLE_INTERRUPTS();
+	//
+	//// do something with adc_measurement
+	//seven_seg_t display_data;
+	//display_data.tens = SEVEN_SEG_LOOKUP[divide(adc_measurement, 100)];
+	//display_data.ones = SEVEN_SEG_LOOKUP[divide(modulo(adc_measurement, 100), 10)];
+	//display_data.decimal = SEVEN_SEG_LOOKUP[modulo(adc_measurement, 10)];
+	//
+	//i2c_send_data(I2C_ADDR_1, I2C_OUTPUT_PORT_1, display_data.tens);
+	//i2c_send_data(I2C_ADDR_1, I2C_OUTPUT_PORT_2, display_data.ones);
+	//i2c_send_data(I2C_ADDR_2, I2C_OUTPUT_PORT_1, display_data.decimal);
+	//}
 }
